@@ -306,6 +306,204 @@ class StreamingKImportance:
         self._pending_count = 0
 
 
+class CovarianceRouter:
+    """Rank-r attention router via streaming covariance decomposition.
+
+    Theory: The top-r eigenvectors of C = K^T K / N represent the directions
+    most likely to receive high attention. For any query q, the projection
+    g = W @ q (where W = top-r eigenvectors) captures how well q aligns
+    with the dominant attention directions.
+
+    Pre-compute H = W @ K^T during prefill. At decode time:
+        scores = (W @ q)^T @ H = O(r × N) instead of O(d × N)
+
+    Cost breakdown:
+        Prefill (per token): O(d²) covariance update (fused with KV write)
+        Prefill (once): O(d³) eigendecompose (~2M ops for d=128)
+        Decode (per token): O(r × d + r × N) routing (~5K ops for r=4, N=1000 blocks)
+
+    Args:
+        rank: Number of principal directions (4-8 is usually sufficient).
+        dim: Head dimension.
+        block_size: Tokens per block for block-level routing.
+        budget: Max blocks to attend to.
+        sink_blocks: Always keep first N blocks.
+        window_blocks: Always keep last N blocks.
+    """
+
+    def __init__(
+        self,
+        rank: int = 4,
+        dim: int = 128,
+        block_size: int = 64,
+        budget: int = 128,
+        sink_blocks: int = 2,
+        window_blocks: int = 4,
+    ):
+        self.rank = rank
+        self.dim = dim
+        self.block_size = block_size
+        self.budget = budget
+        self.sink_blocks = sink_blocks
+        self.window_blocks = window_blocks
+        self.sm_scale = dim ** -0.5
+
+        # State
+        self._cov = None          # [BSZ, HEAD, DIM, DIM] running covariance
+        self._n_tokens = 0
+        self._W = None            # [BSZ, HEAD, RANK, DIM] top-r eigenvectors (router weights)
+        self._H = None            # [BSZ, HEAD, RANK, N_BLOCKS] pre-computed block projections
+        self._finalized = False
+        self._block_keys_sum = None  # [BSZ, HEAD, N_BLOCKS, DIM] block-level key sums
+        self._n_blocks = 0
+        self._pending_keys = None
+        self._pending_count = 0
+        self._initialized = False
+
+    def update_prefill(self, k: torch.Tensor) -> None:
+        """Process key tokens during prefill. Accumulates covariance.
+
+        Args:
+            k: [BSZ, HEAD, T, DIM] key tokens
+        """
+        if k.ndim == 3:
+            k = k.unsqueeze(2)
+
+        bsz, head, t, dim = k.shape
+        k_float = k.float()
+
+        if not self._initialized:
+            self._cov = torch.zeros(bsz, head, dim, dim, device=k.device, dtype=torch.float32)
+            self._block_keys_sum = torch.empty(bsz, head, 0, dim, device=k.device, dtype=torch.float32)
+            self._pending_keys = torch.empty(bsz, head, 0, dim, device=k.device, dtype=k.dtype)
+            self._initialized = True
+
+        # Streaming covariance: C += K^T @ K (batch matmul)
+        # k_float: [BSZ, HEAD, T, DIM]
+        # k_float^T @ k_float: [BSZ, HEAD, DIM, DIM]
+        self._cov += torch.matmul(k_float.transpose(-2, -1), k_float)
+        self._n_tokens += t
+
+        # Accumulate for block-level projections
+        self._pending_keys = torch.cat([self._pending_keys, k], dim=2)
+        self._pending_count += t
+
+        while self._pending_count >= self.block_size:
+            block = self._pending_keys[:, :, :self.block_size, :]
+            self._pending_keys = self._pending_keys[:, :, self.block_size:, :]
+            self._pending_count -= self.block_size
+            # Store block mean key for later projection
+            block_mean = block.float().mean(dim=2, keepdim=True)  # [BSZ, HEAD, 1, DIM]
+            self._block_keys_sum = torch.cat([self._block_keys_sum, block_mean], dim=2)
+            self._n_blocks += 1
+
+    def finalize(self) -> None:
+        """Compute eigenvectors and pre-project all blocks. Call after prefill.
+
+        Cost: O(d³) eigendecompose + O(r × N_blocks × d) projection.
+        For d=128, r=4, N_blocks=1000: ~2M + 512K = 2.5M ops. Negligible.
+        """
+        if self._n_tokens == 0:
+            raise RuntimeError("No tokens processed. Call update_prefill first.")
+
+        # Normalize covariance
+        C = self._cov / self._n_tokens  # [BSZ, HEAD, DIM, DIM]
+
+        # Eigendecompose (symmetric, so use eigh — faster than svd)
+        # eigenvalues in ascending order, take last r
+        bsz, head, dim, _ = C.shape
+        C_flat = C.reshape(bsz * head, dim, dim)
+        eigenvalues, eigenvectors = torch.linalg.eigh(C_flat)
+
+        # Top-r eigenvectors (largest eigenvalues = last r columns)
+        W = eigenvectors[:, :, -self.rank:]  # [BSZ*HEAD, DIM, RANK]
+        W = W.transpose(-2, -1)  # [BSZ*HEAD, RANK, DIM]
+        self._W = W.reshape(bsz, head, self.rank, dim)
+
+        # Pre-project all block means: H = W @ block_means^T
+        # _block_keys_sum: [BSZ, HEAD, N_BLOCKS, DIM]
+        # W: [BSZ, HEAD, RANK, DIM]
+        # H: [BSZ, HEAD, RANK, N_BLOCKS]
+        self._H = torch.matmul(
+            self._W, self._block_keys_sum.transpose(-2, -1)
+        ) * self.sm_scale
+
+        self._finalized = True
+
+    def route(self, q: torch.Tensor) -> torch.Tensor:
+        """Route a query to important blocks. O(r × d + r × N_blocks).
+
+        Args:
+            q: [BSZ, HEAD, DIM] single query token
+
+        Returns:
+            mask: [BSZ, HEAD, N_BLOCKS] bool — which blocks to attend to
+        """
+        if not self._finalized:
+            raise RuntimeError("Call finalize() after prefill before routing.")
+
+        # Project query: g = W @ q  → [BSZ, HEAD, RANK]
+        g = torch.matmul(self._W, q.unsqueeze(-1)).squeeze(-1)
+
+        # Score blocks: scores = g^T @ H → [BSZ, HEAD, N_BLOCKS]
+        scores = torch.matmul(g.unsqueeze(-2), self._H).squeeze(-2)
+
+        # Budget-based selection
+        return self._select_by_budget(scores)
+
+    def _select_by_budget(self, scores: torch.Tensor) -> torch.Tensor:
+        """Select top blocks within budget. O(N) via kthvalue."""
+        bsz, head, n = scores.shape
+
+        if n <= self.budget:
+            return torch.ones(bsz, head, n, dtype=torch.bool, device=scores.device)
+
+        usable = max(self.budget - self.sink_blocks - self.window_blocks, 1)
+        mid_start = self.sink_blocks
+        mid_end = max(n - self.window_blocks, mid_start)
+        mid = scores[:, :, mid_start:mid_end]
+        mid_n = mid.shape[-1]
+
+        if mid_n <= usable:
+            return torch.ones(bsz, head, n, dtype=torch.bool, device=scores.device)
+
+        k_from_top = mid_n - usable
+        threshold, _ = mid.reshape(bsz * head, -1).kthvalue(k=max(k_from_top, 1), dim=-1)
+        threshold = threshold.view(bsz, head, 1)
+
+        mask = torch.ones(bsz, head, n, dtype=torch.bool, device=scores.device)
+        mask[:, :, mid_start:mid_end] = mid >= threshold
+        return mask
+
+    def update_decode(self, k_new: torch.Tensor) -> None:
+        """Add new decode token to router state. O(r × d).
+
+        Args:
+            k_new: [BSZ, HEAD, DIM] new key token
+        """
+        if not self._finalized:
+            raise RuntimeError("Call finalize() first.")
+
+        # Project new key and append to H
+        # h_new = W @ k_new → [BSZ, HEAD, RANK]
+        h_new = torch.matmul(self._W, k_new.unsqueeze(-1)).squeeze(-1) * self.sm_scale
+        self._H = torch.cat([self._H, h_new.unsqueeze(-1)], dim=-1)
+        self._n_blocks += 1  # simplified: 1 token = partial block
+
+    def reset(self):
+        """Clear all state."""
+        self._cov = None
+        self._n_tokens = 0
+        self._W = None
+        self._H = None
+        self._finalized = False
+        self._block_keys_sum = None
+        self._n_blocks = 0
+        self._pending_keys = None
+        self._pending_count = 0
+        self._initialized = False
+
+
 # --- Batch utility for prefill ---
 
 def compute_k_importance(

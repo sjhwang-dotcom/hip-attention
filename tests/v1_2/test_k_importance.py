@@ -16,6 +16,7 @@ _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 
 StreamingKImportance = _mod.StreamingKImportance
+CovarianceRouter = _mod.CovarianceRouter
 compute_k_importance = _mod.compute_k_importance
 select_by_budget = _mod.select_by_budget
 
@@ -275,3 +276,82 @@ class TestSelectByBudget:
         mask = select_by_budget(imp, budget=10, sink_blocks=3, window_blocks=3)
         assert mask[0, 0, :3].all()
         assert mask[0, 0, -3:].all()
+
+
+class TestCovarianceRouter:
+    def test_prefill_and_finalize(self):
+        router = CovarianceRouter(rank=4, dim=64, block_size=4, budget=8)
+        k = torch.randn(1, 2, 32, 64)  # 32 tokens = 8 blocks
+        router.update_prefill(k)
+        router.finalize()
+        assert router._W.shape == (1, 2, 4, 64)
+        assert router._H.shape == (1, 2, 4, 8)
+
+    def test_route_output_shape(self):
+        router = CovarianceRouter(rank=4, dim=64, block_size=4, budget=4)
+        router.update_prefill(torch.randn(1, 2, 40, 64))
+        router.finalize()
+        q = torch.randn(1, 2, 64)
+        mask = router.route(q)
+        assert mask.shape == (1, 2, 10)
+        assert mask.dtype == torch.bool
+
+    def test_budget_enforced(self):
+        router = CovarianceRouter(rank=4, dim=64, block_size=4, budget=4,
+                                   sink_blocks=0, window_blocks=0)
+        router.update_prefill(torch.randn(1, 1, 40, 64))
+        router.finalize()
+        q = torch.randn(1, 1, 64)
+        mask = router.route(q)
+        n_active = mask.sum().item()
+        assert n_active <= 5, f"Budget 4 but got {n_active}"
+
+    def test_high_alignment_query_selects_right_block(self):
+        router = CovarianceRouter(rank=4, dim=64, block_size=4, budget=2,
+                                   sink_blocks=0, window_blocks=0)
+        k = torch.randn(1, 1, 20, 64) * 0.1
+        # Block 3 (tokens 12-15) has very distinctive direction
+        direction = torch.randn(64)
+        direction = direction / direction.norm() * 10.0
+        k[0, 0, 12:16, :] = direction.unsqueeze(0).expand(4, -1)
+        router.update_prefill(k)
+        router.finalize()
+
+        # Query aligned with that direction should select block 3
+        q = direction.unsqueeze(0).unsqueeze(0)  # [1, 1, 64]
+        mask = router.route(q)
+        assert mask[0, 0, 3].item(), "Aligned query should select the matching block"
+
+    def test_decode_extends_H(self):
+        router = CovarianceRouter(rank=4, dim=64, block_size=4, budget=16)
+        router.update_prefill(torch.randn(1, 2, 32, 64))
+        router.finalize()
+        assert router._H.shape[-1] == 8
+
+        router.update_decode(torch.randn(1, 2, 64))
+        assert router._H.shape[-1] == 9
+
+    def test_cost_is_negligible(self):
+        """Verify eigendecompose cost is tiny."""
+        import time
+        router = CovarianceRouter(rank=4, dim=128, block_size=64, budget=64)
+        k = torch.randn(1, 32, 4096, 128)  # 32 heads, 4K tokens
+
+        t0 = time.perf_counter()
+        router.update_prefill(k)
+        t_cov = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        router.finalize()
+        t_eig = time.perf_counter() - t0
+
+        print(f"\n  Covariance accumulation (4K tokens): {t_cov*1000:.1f} ms")
+        print(f"  Eigendecompose: {t_eig*1000:.1f} ms")
+
+        # Route 100 queries
+        t0 = time.perf_counter()
+        for _ in range(100):
+            q = torch.randn(1, 32, 128)
+            router.route(q)
+        t_route = time.perf_counter() - t0
+        print(f"  Route 100 queries: {t_route*1000:.1f} ms ({t_route/100*1e6:.0f} us/query)")
