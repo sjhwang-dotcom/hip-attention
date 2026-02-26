@@ -5,6 +5,7 @@ from dataclasses import InitVar, dataclass, field
 from typing import List, Optional, Union
 
 from hip_attn.v1_2.attention_metadata import ScanStage
+from hip_attn.v1_2.config.delta_config import DeltaAttentionConfig
 
 HIP_CONFIG_PRESET = os.getenv("HIP_CONFIG_PRESET", "default")
 
@@ -392,6 +393,8 @@ class HiPAttentionConfig:
     force_dense: bool = False
     prefill_dense_threshold: int = 8192
 
+    delta_config: DeltaAttentionConfig = field(default_factory=DeltaAttentionConfig)
+
     json_or_path: InitVar[Optional[str]] = None
     json_override: InitVar[Optional[str]] = None
 
@@ -471,6 +474,7 @@ class HiPAttentionConfig:
                     warnings.warn(
                         "envvar HIP_DELTA_ATTENTION_ARGS is overrided by hip attention args"
                     )
+                # backward compat: paged_hip.py still reads env vars in Phase 1
                 os.environ["HIP_DELTA_ATTENTION_ARGS"] = given_args
                 parsed_json.pop("__delta_attention_args")
             if "__using_dense_prefill" in parsed_json:
@@ -526,6 +530,13 @@ class HiPAttentionConfig:
 
             if parsed_json:
                 raise ValueError(f"Unknown keys in json: {parsed_json.keys()}")
+
+        # Build the typed delta config from environment variables.
+        # In Phase 1 this is the single source of truth; paged_hip.py still
+        # reads env vars directly (to be replaced in Phase 2).
+        self.delta_config = DeltaAttentionConfig.from_env(
+            using_extend=self.using_extend,
+        )
 
         if (self.prefill_layers is None) and (self.layers is not None):
             self.prefill_layers = self.layers
