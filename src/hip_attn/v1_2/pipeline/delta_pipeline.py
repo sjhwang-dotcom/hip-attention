@@ -20,8 +20,10 @@ from hip_attn.v1_2.attention_metadata import (
     HiPAttentionArgs,
     HiPAttentionOutputMetadata,
 )
+from hip_attn.v1_2.cache.kv_accessor import KVAccessor
 from hip_attn.v1_2.config.delta_config import DeltaAttentionConfig
 from hip_attn.v1_2.query_sparse_attention import query_sparse_attention
+from hip_attn.v1_2.rope.rope_adapter import RoPEAdapter
 
 try:
     from sglang.srt.distributed import get_tensor_model_parallel_rank
@@ -36,13 +38,6 @@ def get_local_rank() -> int:
         return get_tensor_model_parallel_rank()
     else:
         return 0
-
-
-def rotate_half(x: torch.Tensor):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
 
 
 @numba.njit(parallel=False)
@@ -112,6 +107,9 @@ class DeltaPipeline:
         test_qsa_masking = os.getenv("HIP_DEBUG_DELTA_QSA", "0") == "1"
         delta_pool_q = os.getenv("DELTA_POOL_Q", "0") == "1"
 
+        # Unified KV cache accessor -- avoids redundant gather operations.
+        kv_accessor = KVAccessor(args)
+
         # Stage 1: Sparse context
         context_sparse, metadata, sparse_mx, sparse_nc = self._compute_sparse(
             query, sm_scale, k, v, args, cached_metadata,
@@ -151,6 +149,7 @@ class DeltaPipeline:
                 context_sparse, context_sparse_raw,
                 metadata,
                 sparse_mx, sparse_nc,
+                kv_accessor=kv_accessor,
             )
 
         # Stage 4: Delta correction
@@ -406,6 +405,7 @@ class DeltaPipeline:
         metadata,
         sparse_mx,
         sparse_nc,
+        kv_accessor: KVAccessor = None,
     ):
         """Stage 3: Dense recomputation via QSA.
 
@@ -425,15 +425,11 @@ class DeltaPipeline:
         ):
             assert delta_attention_args_extend == "none"
             # TODO: using paged attention
-            repeated_k = args.gather_k_from_paged_cache(disable_gqa=True, gqa_q=query)
-            repeated_v = args.gather_v_from_paged_cache(
-                disable_gqa=True, gqa_q=query
+            seq_len = args.position_ids.amax().item() + 1
+            repeated_k, repeated_v = kv_accessor.get_contiguous(
+                seq_len=seq_len, disable_gqa=True, gqa_q=query,
             )  # B, T, H, D
             assert repeated_k.shape[2] < 128
-
-            seq_len = args.position_ids.amax().item() + 1
-            repeated_k = repeated_k[:, :seq_len]
-            repeated_v = repeated_v[:, :seq_len]
 
             query_for_recomp = query_for_dense
 
@@ -442,24 +438,14 @@ class DeltaPipeline:
             assert cos.ndim == 2, cos.shape
             assert sin.shape == cos.shape, sin.shape
 
-            cos = cos.view(1, cos.shape[-2], 1, cos.shape[-1])
-            sin = sin.view(1, sin.shape[-2], 1, sin.shape[-1])
-
-            idx_tsrc = torch.arange(0, repeated_k.shape[1], device=cos.device)
-            idx_tsrc.clamp_min_(seq_len - args.model_context_length)
-
-            repeated_k = (
-                (repeated_k.to(cos.dtype) * cos[:, idx_tsrc, :, :])
-                + (rotate_half(repeated_k.to(sin.dtype)) * sin[:, idx_tsrc, :, :])
-            ).to(repeated_k.dtype)
-
-            query_for_recomp = (
-                (query_for_recomp * cos[:, args.position_ids.view(-1)[idx], :, :])
-                + (
-                    rotate_half(query_for_recomp)
-                    * sin[:, args.position_ids.view(-1)[idx], :, :]
-                )
-            ).to(query_for_recomp.dtype)
+            rope_adapter = RoPEAdapter(
+                cos, sin,
+                model_context_length=args.model_context_length,
+                extend_mode=delta_attention_args_extend,
+            )
+            query_for_recomp, repeated_k = rope_adapter.prepare_for_qsa(
+                query_for_recomp, repeated_k, args.position_ids, idx, seq_len,
+            )
 
             assert args.position_ids.shape[0] == 1
             context_dense = (
@@ -801,8 +787,8 @@ class DeltaPipeline:
                                     "k": k,
                                     "v": k,
                                     "using_paged_cache": args.using_paged_cache,
-                                    "k_paged": args.gather_k_from_paged_cache(),
-                                    "v_paged": args.gather_v_from_paged_cache(),
+                                    "k_paged": kv_accessor.get_contiguous()[0],
+                                    "v_paged": kv_accessor.get_contiguous()[1],
                                     "seq_lens": args_sparse.position_ids + 1,
                                     "indices": indices,
                                     "ks": ks,
