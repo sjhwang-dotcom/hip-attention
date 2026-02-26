@@ -87,6 +87,25 @@ def num_streaming_multiprocessor():
 _HIP_FLASHDECODE_THRESH = int(os.getenv("HIP_FLASHDECODE_THRESH", "32"))
 _HIP_DISABLE_FLASHDECODE = os.environ.get("HIP_DISABLE_FLASHDECODE", "0") == "1"
 
+# --- Cached env vars for scan loop (called per stage × per layer) ---
+_HIP_DEBUG_EXCLUDE_LANDMARK_RAW = os.environ.get("HIP_DEBUG_EXCLUDE_LANDMARK", None)
+_HIP_DEBUG_EXCLUDE_LANDMARK = (
+    list(map(int, _HIP_DEBUG_EXCLUDE_LANDMARK_RAW.split(",")))
+    if _HIP_DEBUG_EXCLUDE_LANDMARK_RAW is not None else []
+)
+_HIP_DEBUG_TOPKMEAN = _HIP_DEBUG_TOPKMEAN
+_HIP_DEBUG_TOPK_WINDOW = int(os.getenv("HIP_DEBUG_TOPK_WINDOW", "8"))
+_HIP_DEBUG_SOFTMAXMEAN = _HIP_DEBUG_SOFTMAXMEAN
+_HIP_DEBUG_FLATTENMEAN = _HIP_DEBUG_FLATTENMEAN
+_HIP_DEBUG_FLATTENTOPKMEAN = _HIP_DEBUG_FLATTENTOPKMEAN
+_HIP_HEAD_REDUCE = _HIP_HEAD_REDUCE
+_APPLY_V_DOT = _APPLY_V_DOT
+_HIP_DEBUG_UNION_HEAD = _HIP_DEBUG_UNION_HEAD
+_HIP_DEBUG_ADD_DELAY_WINDOW = _HIP_DEBUG_ADD_DELAY_WINDOW
+_HIP_DEBUG_SNAP_KV = os.getenv("HIP_DEBUG_SNAP_KV", "0") == "1"
+_HIP_DEBUG_IMPORTANT_K = os.getenv("HIP_DEBUG_IMPORTANT_K", "0") == "1"
+_SCAN_BLOCK_CHUNK = _SCAN_BLOCK_CHUNK
+
 
 def get_block_sparse_backend(
     q: torch.Tensor,
@@ -263,7 +282,7 @@ def dual_stage_quadratic_hip_attention(
     BLOCK_SIZE_Q = args.stages[0].stage_block_size_q
     BDST = triton.cdiv(TDST, BLOCK_SIZE_Q)
     BDST_SCAN = triton.cdiv(BDST, STAGE_STRIDE)
-    BLOCK_CHUNK = int(os.getenv("SCAN_BLOCK_CHUNK", "64"))
+    BLOCK_CHUNK = _SCAN_BLOCK_CHUNK
     chunk_size = args.stages[0].stage_chunk_size
     chunk_count = triton.cdiv(
         max(0, MAX_TSRC - args.sink_token_size - args.sliding_window_size), chunk_size
@@ -464,14 +483,7 @@ def dual_stage_quadratic_hip_attention(
                 #     else:
                 #         k_mask = k_mask_original
 
-                debug_exclude_landmark = []
-                if "HIP_DEBUG_EXCLUDE_LANDMARK" in os.environ:
-                    debug_exclude_landmark = list(
-                        map(
-                            lambda x: int(x),
-                            os.environ["HIP_DEBUG_EXCLUDE_LANDMARK"].split(","),
-                        )
-                    )
+                debug_exclude_landmark = _HIP_DEBUG_EXCLUDE_LANDMARK
 
                 assert q.shape[1] <= BDST * BLOCK_SIZE_Q
                 if (
@@ -570,13 +582,13 @@ def dual_stage_quadratic_hip_attention(
 
                     # print('landmark based sampling', args.layer_id)
                 elif (
-                    os.getenv("HIP_DEBUG_TOPKMEAN", "0") == "1"
+                    _HIP_DEBUG_TOPKMEAN
                     and (i_stage == 0)
                     and (BDST > 1)
                     and ((q.shape[1] % BLOCK_SIZE_Q) == 0)
                     and (args.position_ids.shape[0] == 1)
                 ):
-                    debug_topk_window = int(os.getenv("HIP_DEBUG_TOPK_WINDOW", "8"))
+                    debug_topk_window = _HIP_DEBUG_TOPK_WINDOW
                     k_dense = args.gather_k_from_paged_cache(
                         chunk_size=chunk_size, disable_gqa=True, gqa_q=q
                     )
@@ -607,7 +619,7 @@ def dual_stage_quadratic_hip_attention(
                     scores = scores.permute(0, 2, 1, 3)
                     out_scores[:, :, :, : scores.shape[-1]] = scores
                 elif (
-                    os.getenv("HIP_DEBUG_SOFTMAXMEAN", "0") == "1"
+                    _HIP_DEBUG_SOFTMAXMEAN
                     and (i_stage == 0)
                     and (BDST > 1)
                     and ((q.shape[1] % BLOCK_SIZE_Q) == 0)
@@ -686,7 +698,7 @@ def dual_stage_quadratic_hip_attention(
                     # print(scores[0,:,0,:])
                     out_scores[:, :, :, : scores.shape[-1]] = scores
                 elif (
-                    os.getenv("HIP_DEBUG_FLATTENMEAN", "0") == "1"
+                    _HIP_DEBUG_FLATTENMEAN
                     and (i_stage == 0)
                     and (BDST > 1)
                     and ((q.shape[1] % BLOCK_SIZE_Q) == 0)
@@ -763,7 +775,7 @@ def dual_stage_quadratic_hip_attention(
                     # print(scores[0,:,0,:])
                     out_scores[:, :, :, : scores.shape[-1]] = scores
                 elif (
-                    os.getenv("HIP_DEBUG_FLATTENTOPKMEAN", "0") == "1"
+                    _HIP_DEBUG_FLATTENTOPKMEAN
                     and (i_stage == 0)
                     and (BDST > 1)
                     and ((q.shape[1] % BLOCK_SIZE_Q) == 0)
@@ -783,7 +795,7 @@ def dual_stage_quadratic_hip_attention(
                         vec_rope = (vec * cos) + (rotate_half(vec) * sin)
                         return vec_rope
 
-                    debug_topk_window = int(os.getenv("HIP_DEBUG_TOPK_WINDOW", "8"))
+                    debug_topk_window = _HIP_DEBUG_TOPK_WINDOW
                     k_dense = args.gather_k_from_paged_cache(
                         chunk_size=chunk_size, disable_gqa=True, gqa_q=q
                     )[:, args.sink_token_size : -args.sliding_window_size, :, :]
@@ -869,9 +881,7 @@ def dual_stage_quadratic_hip_attention(
                     )
 
                 # TODO: OPTIMIZE THIS. Add head unified version of HiP.
-                HEAD_REDUCE_MODE = os.getenv(
-                    "HIP_HEAD_REDUCE", DEFAULT_VALUE_HIP_HEAD_REDUCE
-                )
+                HEAD_REDUCE_MODE = _HIP_HEAD_REDUCE
                 if (
                     # always reduce the head.
                     (HEAD_REDUCE_MODE == "1")
@@ -976,7 +986,7 @@ def dual_stage_quadratic_hip_attention(
             torch.cuda.set_device(pre_device)
 
             if stage_info.require_post_sort:
-                apply_v_dot = os.getenv("APPLY_V_DOT", "0") == "1"
+                apply_v_dot = _APPLY_V_DOT
                 # apply_v_dot = apply_v_dot and (i_stage == (len(stages) - 1))
                 apply_v_dot = apply_v_dot and (i_stage != 0)
                 if apply_v_dot:
@@ -1133,14 +1143,14 @@ def dual_stage_quadratic_hip_attention(
         )
 
         # NOTE: union head masks
-        if os.getenv("HIP_DEBUG_UNION_HEAD", "0") == "1":
-            assert os.getenv("HIP_HEAD_REDUCE", DEFAULT_VALUE_HIP_HEAD_REDUCE) == "0"
+        if _HIP_DEBUG_UNION_HEAD:
+            assert _HIP_HEAD_REDUCE == "0"
             # args.disable_flashdecode = True
             # B BDST H CHUNK
             indices = indices.flatten(-2, -1).unsqueeze(-2).repeat(1, 1, HEAD, 1)
 
         # NOTE: sampled indices might be delayed
-        if os.getenv("HIP_DEBUG_ADD_DELAY_WINDOW", "0") == "1":
+        if _HIP_DEBUG_ADD_DELAY_WINDOW:
             delayed_indices = [
                 indices,
             ]
@@ -1152,7 +1162,7 @@ def dual_stage_quadratic_hip_attention(
             # print(indices.shape)
 
         # NOTE: performing SnapKV
-        if (os.getenv("HIP_DEBUG_SNAP_KV", "0") == "1") and (BDST > 1):
+        if _HIP_DEBUG_SNAP_KV and (BDST > 1):
             is_paged = False
             if k_mask_original is None:
                 is_paged = True
@@ -1205,7 +1215,7 @@ def dual_stage_quadratic_hip_attention(
             indices = torch.concat([indices, sw_indices], dim=-1)
 
         # NOTE: adding important Ks
-        if (os.getenv("HIP_DEBUG_IMPORTANT_K", "0") == "1") and (BDST > 1):
+        if _HIP_DEBUG_IMPORTANT_K and (BDST > 1):
             k_seq = args.gather_k_from_paged_cache(chunk_size=chunk_size)
             k_bos = k_seq[:, :1, :, :].contiguous().permute(0, 2, 1, 3)
             k_seq = k_seq.permute(0, 2, 1, 3)

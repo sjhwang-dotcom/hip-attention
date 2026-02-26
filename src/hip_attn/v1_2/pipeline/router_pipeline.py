@@ -256,8 +256,11 @@ class RouterAttentionPipeline:
         k_cat = torch.cat(all_k, dim=0)  # [total_k, H_kv, D]
         v_cat = torch.cat(all_v, dim=0)  # [total_k, H_kv, D_v]
 
-        cu_seqlens_q_t = torch.tensor(cu_seqlens_q_list, dtype=torch.int32, device=q.device)
-        cu_seqlens_k_t = torch.tensor(cu_seqlens_k_list, dtype=torch.int32, device=q.device)
+        cu_seqlens_q_t = torch.zeros(B + 1, dtype=torch.int32, device=q.device)
+        cu_seqlens_k_t = torch.zeros(B + 1, dtype=torch.int32, device=q.device)
+        for i in range(B + 1):
+            cu_seqlens_q_t[i] = cu_seqlens_q_list[i]
+            cu_seqlens_k_t[i] = cu_seqlens_k_list[i]
 
         max_seqlen_q = 1
         max_seqlen_k = max(cu_seqlens_k_list[i+1] - cu_seqlens_k_list[i] for i in range(B))

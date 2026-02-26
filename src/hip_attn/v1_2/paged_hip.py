@@ -999,16 +999,17 @@ def _forward_fa3(
     tp_k_head, tp_k_dim = k.shape[2:]
     tp_v_head, tp_v_dim = v.shape[2:]
 
-    cu_seqlens_q = torch.tensor([0, q.shape[1]], dtype=torch.int32, device=q.device)
+    cu_seqlens_q = torch.zeros(2, dtype=torch.int32, device=q.device)
+    cu_seqlens_q[1] = q.shape[1]
     max_seqlen_q = q.shape[1]
-    cu_seqlens_k = torch.zeros((2,), dtype=torch.int32, device=k.device)
+    cu_seqlens_k = torch.zeros(2, dtype=torch.int32, device=k.device)
     cu_seqlens_k[1] = position_ids[0, len_query_for_fa3 - 1] + 1
     max_seqlen_k = k.shape[1]
 
     context_fa3 = flash_attn_varlen_func(
-        q=q.view(-1, tp_q_head, tp_q_dim).contiguous(),
-        k=k.view(-1, tp_k_head, tp_k_dim).contiguous(),
-        v=v.view(-1, tp_v_head, tp_v_dim).contiguous(),
+        q=q.reshape(-1, tp_q_head, tp_q_dim),
+        k=k.reshape(-1, tp_k_head, tp_k_dim),
+        v=v.reshape(-1, tp_v_head, tp_v_dim),
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=max_seqlen_q,
