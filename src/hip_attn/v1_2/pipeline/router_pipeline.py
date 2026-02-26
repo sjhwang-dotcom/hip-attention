@@ -24,6 +24,7 @@ import torch.nn.functional as F
 
 try:
     from hip_attn.v1_2.topk.k_importance import CovarianceRouter
+    from hip_attn.v1_2.topk.running_stats import RunningBlockStats, RunningStatsConfig
 except ImportError:
     # Allow direct file import for testing
     import importlib.util as _ilu
@@ -33,6 +34,13 @@ except ImportError:
     _m = _ilu.module_from_spec(_s)
     _s.loader.exec_module(_m)
     CovarianceRouter = _m.CovarianceRouter
+
+    _p2 = _os.path.join(_os.path.dirname(__file__), "..", "topk", "running_stats.py")
+    _s2 = _ilu.spec_from_file_location("running_stats", _os.path.abspath(_p2))
+    _m2 = _ilu.module_from_spec(_s2)
+    _s2.loader.exec_module(_m2)
+    RunningBlockStats = _m2.RunningBlockStats
+    RunningStatsConfig = _m2.RunningStatsConfig
 
 
 @dataclass
@@ -54,6 +62,7 @@ class RouterConfig:
 class RouterState:
     """Per-layer router state."""
     router: CovarianceRouter
+    stats: Optional[RunningBlockStats] = None
     finalized: bool = False
 
 
@@ -92,7 +101,12 @@ class RouterAttentionPipeline:
                 sink_blocks=self.config.sink_blocks,
                 window_blocks=self.config.window_blocks,
             )
-            self.states[layer_id] = RouterState(router=router)
+            max_blocks = 1024 * 1024 // self.config.block_size  # 1M tokens max
+            stats = RunningBlockStats(
+                max_blocks=max_blocks,
+                num_heads=self.num_heads_kv,
+            )
+            self.states[layer_id] = RouterState(router=router, stats=stats)
         return self.states[layer_id]
 
     def forward_prefill(
@@ -193,7 +207,11 @@ class RouterAttentionPipeline:
         else:
             q_for_route = q_squeezed
 
-        block_mask = state.router.route(q_for_route)  # [B, H_kv, N_blocks]
+        # Get empirical boost from running statistics
+        n_blocks = block_mask_size = seq_lens.max().item() // page_size + 1
+        empirical_boost = state.stats.get_boost(n_blocks) if state.stats is not None else None
+
+        block_mask = state.router.route(q_for_route, empirical_boost=empirical_boost)
 
         # 2. Update router with new K
         k_for_router = k_new.squeeze(1)  # [B, H_kv, D]
@@ -274,6 +292,16 @@ class RouterAttentionPipeline:
             softmax_scale=sm_scale,
             causal=False,
         )
+
+        # 5. Update running statistics with selected blocks (free adaptation)
+        if state.stats is not None:
+            for b in range(B):
+                seq_len = seq_lens[b].item()
+                n_pages = (seq_len + page_size - 1) // page_size
+                mask_b = block_mask[b, :, :n_pages]
+                selected = mask_b.any(dim=0).nonzero(as_tuple=True)[0]
+                state.stats.update(selected, attention_lse=None,
+                                   block_size=page_size)
 
         # output: [B, H_q, D_v]
         return output.unsqueeze(1)  # [B, 1, H_q, D_v]

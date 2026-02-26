@@ -430,11 +430,17 @@ class CovarianceRouter:
 
         self._finalized = True
 
-    def route(self, q: torch.Tensor) -> torch.Tensor:
+    def route(
+        self,
+        q: torch.Tensor,
+        empirical_boost: torch.Tensor = None,
+    ) -> torch.Tensor:
         """Route a query to important blocks. O(r × d + r × N_blocks).
 
         Args:
             q: [BSZ, HEAD, DIM] single query token
+            empirical_boost: [HEAD, N_BLOCKS] float — running stats feedback.
+                Added to covariance scores before budget selection.
 
         Returns:
             mask: [BSZ, HEAD, N_BLOCKS] bool — which blocks to attend to
@@ -447,6 +453,11 @@ class CovarianceRouter:
 
         # Score blocks: scores = g^T @ H → [BSZ, HEAD, N_BLOCKS]
         scores = torch.matmul(g.unsqueeze(-2), self._H).squeeze(-2)
+
+        # Add empirical boost from running statistics (free adaptation)
+        if empirical_boost is not None:
+            n = min(scores.shape[-1], empirical_boost.shape[-1])
+            scores[..., :n] = scores[..., :n] + empirical_boost[..., :n]
 
         # Budget-based selection
         return self._select_by_budget(scores)
