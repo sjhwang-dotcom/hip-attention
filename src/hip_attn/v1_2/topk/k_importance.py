@@ -1,20 +1,29 @@
 """Streaming K-Importance: Budget-based Sparse Attention via Key Pre-scoring.
 
-Maintains a fixed-budget set of "important" KV blocks in streaming fashion.
-As new tokens enter the KV cache, importance scores are updated incrementally
-in O(1) per token. When query arrives, the pre-computed importance mask
-eliminates the need for hierarchical scan.
+Two-signal block selection:
+
+  1. IMPORTANCE (mean-key proxy score):
+     Tokens aligned with the mean key direction. These are "popular" tokens
+     that most queries will attend to. Delta correction CAN recover these
+     if pruned, so they are lower priority.
+
+  2. OUTLIER (deviation from mean):
+     Tokens far from the mean key direction. These are rare but critical —
+     when a query does attend to them, no nearby token can substitute.
+     Delta correction CANNOT recover these, so they must be kept.
+
+  keep_mask = (importance > τ_imp) OR (outlier > τ_out)
 
 Theory:
-    importance(k_j) = E_q[ softmax(q^T K / sqrt(d))_j ]
+    RoPE creates locality bias: cos(θ·Δpos) decays with distance.
+    Most attention mass is predictable (recent + sink + high-importance).
+    The hard part is finding sparse outliers in the middle region.
+    Outlier detection via Welford's online variance catches exactly these.
 
-    Approximation: maintain running proxy (mean key) and score each block
-    against it. Blocks below adaptive threshold are excluded from attention.
-
-    Streaming guarantee: amortized O(1) per new token via:
-    - Running mean update: O(1)
-    - New block scoring: O(block_size * dim) every block_size tokens
-    - Budget enforcement: O(1) via threshold tracking
+Streaming guarantee: O(1) amortized per token via:
+    - Welford mean/variance update: O(dim) per token
+    - Block scoring: O(block_size * dim) every block_size tokens
+    - Budget enforcement: O(N) via kthvalue (amortized per block)
 """
 
 from __future__ import annotations
@@ -52,6 +61,7 @@ class StreamingKImportance:
         window_blocks: int = 4,
         dim: int = 128,
         decay: float = 1.0,
+        outlier_sigma: float = 2.0,
     ):
         self.budget = budget
         self.block_size = block_size
@@ -59,26 +69,30 @@ class StreamingKImportance:
         self.window_blocks = window_blocks
         self.sm_scale = dim ** -0.5
         self.decay = decay
+        self.outlier_sigma = outlier_sigma  # Blocks > σ stdev from mean are outliers
 
         # State (initialized on first token)
         self._initialized = False
         self._device: Optional[torch.device] = None
         self._dtype: Optional[torch.dtype] = None
 
-        # Running proxy: Welford's online mean
-        self._k_sum: Optional[torch.Tensor] = None  # [BSZ, HEAD, DIM]
+        # Welford's online algorithm: running mean + M2 for variance
+        # Tracks per-head statistics of key norms in hidden dim
+        self._k_sum: Optional[torch.Tensor] = None     # [BSZ, HEAD, DIM]
+        self._k_sq_sum: Optional[torch.Tensor] = None  # [BSZ, HEAD, DIM] sum of squares
         self._n_tokens: int = 0
 
-        # Block importance scores: [BSZ, HEAD, N_BLOCKS]
-        self._scores: Optional[torch.Tensor] = None
+        # Block-level scores: [BSZ, HEAD, N_BLOCKS]
+        self._importance_scores: Optional[torch.Tensor] = None  # proxy attention score
+        self._outlier_scores: Optional[torch.Tensor] = None     # deviation from mean
         self._n_blocks: int = 0
 
         # Cached mask: [BSZ, HEAD, N_BLOCKS]
         self._mask: Optional[torch.Tensor] = None
-        self._threshold: Optional[torch.Tensor] = None  # [BSZ, HEAD]
+        self._threshold: Optional[torch.Tensor] = None
 
         # Pending block accumulator
-        self._pending_keys: Optional[torch.Tensor] = None  # [BSZ, HEAD, <=block_size, DIM]
+        self._pending_keys: Optional[torch.Tensor] = None
         self._pending_count: int = 0
 
     def _init_state(self, k_token: torch.Tensor):
@@ -87,7 +101,9 @@ class StreamingKImportance:
         self._device = k_token.device
         self._dtype = k_token.dtype
         self._k_sum = torch.zeros(bsz, head, dim, device=self._device, dtype=torch.float32)
-        self._scores = torch.empty(bsz, head, 0, device=self._device, dtype=torch.float32)
+        self._k_sq_sum = torch.zeros(bsz, head, dim, device=self._device, dtype=torch.float32)
+        self._importance_scores = torch.empty(bsz, head, 0, device=self._device, dtype=torch.float32)
+        self._outlier_scores = torch.empty(bsz, head, 0, device=self._device, dtype=torch.float32)
         self._mask = torch.empty(bsz, head, 0, dtype=torch.bool, device=self._device)
         self._threshold = torch.full((bsz, head), float("-inf"), device=self._device)
         self._pending_keys = torch.empty(
@@ -110,8 +126,10 @@ class StreamingKImportance:
         if not self._initialized:
             self._init_state(k_new[:, :, 0, :])
 
-        # Update running sum (for mean proxy)
-        self._k_sum += k_new.float().sum(dim=2)
+        # Welford update: running sum + sum of squares (for mean + variance)
+        k_float = k_new.float()
+        self._k_sum += k_float.sum(dim=2)
+        self._k_sq_sum += (k_float ** 2).sum(dim=2)
         self._n_tokens += n_new
 
         # Accumulate pending keys
@@ -126,66 +144,110 @@ class StreamingKImportance:
             self._flush_block(block_keys)
 
     def _flush_block(self, block_keys: torch.Tensor) -> None:
-        """Score a complete block and update budget. O(block_size * dim).
+        """Score a complete block for importance + outlier. O(block_size * dim).
 
-        Args:
-            block_keys: [BSZ, HEAD, block_size, DIM]
+        Two scores per block:
+        1. importance = max(proxy · k_j) — how likely any query attends here
+        2. outlier = max(||k_j - mean|| / σ) — how different from typical keys
+           Outliers can't be recovered by delta correction → must keep.
         """
-        # Compute proxy = running mean
-        proxy = (self._k_sum / self._n_tokens).unsqueeze(2)  # [BSZ, HEAD, 1, DIM]
+        k_float = block_keys.float()  # [BSZ, HEAD, block_size, DIM]
 
-        # Score = max proxy attention within block
-        # proxy @ block_keys^T → [BSZ, HEAD, 1, block_size]
-        raw_scores = torch.matmul(proxy, block_keys.transpose(-2, -1)) * self.sm_scale
-        block_score = raw_scores.squeeze(2).amax(dim=-1)  # [BSZ, HEAD]
+        # --- Signal 1: Importance (proxy attention score) ---
+        proxy = (self._k_sum / self._n_tokens).unsqueeze(2)  # [BSZ, HEAD, 1, DIM]
+        raw_scores = torch.matmul(proxy, k_float.transpose(-2, -1)) * self.sm_scale
+        importance = raw_scores.squeeze(2).amax(dim=-1)  # [BSZ, HEAD]
+
+        # --- Signal 2: Outlier (deviation from running mean) ---
+        mean = (self._k_sum / self._n_tokens).unsqueeze(2)  # [BSZ, HEAD, 1, DIM]
+        var = (self._k_sq_sum / self._n_tokens) - (self._k_sum / self._n_tokens) ** 2
+        std = var.clamp(min=1e-8).sqrt().unsqueeze(2)  # [BSZ, HEAD, 1, DIM]
+
+        # Per-token deviation: ||( k_j - mean ) / std||_2
+        normalized_dev = (k_float - mean) / std  # [BSZ, HEAD, block_size, DIM]
+        token_outlier = normalized_dev.norm(dim=-1)  # [BSZ, HEAD, block_size]
+        # Normalize by sqrt(dim) so score is ~1 for normal, >2 for outlier
+        dim = block_keys.shape[-1]
+        token_outlier = token_outlier / (dim ** 0.5)
+        block_outlier = token_outlier.amax(dim=-1)  # [BSZ, HEAD]
 
         # Apply decay to old scores
-        if self.decay < 1.0 and self._scores.shape[-1] > 0:
-            self._scores *= self.decay
+        if self.decay < 1.0 and self._importance_scores.shape[-1] > 0:
+            self._importance_scores *= self.decay
+            self._outlier_scores *= self.decay
 
-        # Append new block score
-        self._scores = torch.cat(
-            [self._scores, block_score.unsqueeze(-1)], dim=-1
+        # Append
+        self._importance_scores = torch.cat(
+            [self._importance_scores, importance.unsqueeze(-1)], dim=-1
+        )
+        self._outlier_scores = torch.cat(
+            [self._outlier_scores, block_outlier.unsqueeze(-1)], dim=-1
         )
         self._n_blocks += 1
 
-        # Update mask with budget enforcement
         self._update_mask()
 
     def _update_mask(self) -> None:
-        """Recompute mask based on budget. O(N) via kthvalue, no sort."""
+        """Recompute mask from importance OR outlier. O(N) via kthvalue.
+
+        A block is kept if:
+          (importance >= threshold) OR (outlier >= outlier_sigma)
+
+        Outlier blocks are always kept regardless of importance budget,
+        because delta correction cannot recover them.
+        """
         n = self._n_blocks
         usable_budget = max(
             self.budget - self.sink_blocks - self.window_blocks, 1
         )
 
         if n <= self.budget:
-            # Under budget: keep everything
             self._mask = torch.ones(
-                *self._scores.shape, dtype=torch.bool, device=self._device
+                *self._importance_scores.shape, dtype=torch.bool, device=self._device
             )
             return
 
-        # Middle region (excluding sink + window)
+        # Outlier mask: blocks with deviation > outlier_sigma (ALWAYS kept)
+        outlier_mask = self._outlier_scores >= self.outlier_sigma
+
+        # Middle region for importance-based selection
         mid_start = self.sink_blocks
         mid_end = max(n - self.window_blocks, mid_start)
-        mid_scores = self._scores[:, :, mid_start:mid_end]
-        mid_n = mid_scores.shape[-1]
+        mid_importance = self._importance_scores[:, :, mid_start:mid_end]
+        mid_outlier = outlier_mask[:, :, mid_start:mid_end]
+        mid_n = mid_importance.shape[-1]
+
+        # Count outliers already in budget (they're free — must keep)
+        n_outliers_in_mid = mid_outlier.sum(dim=-1)  # [BSZ, HEAD]
+        remaining_budget = (usable_budget - n_outliers_in_mid).clamp(min=1)
 
         if mid_n <= usable_budget:
-            self._mask = torch.ones_like(self._scores, dtype=torch.bool)
+            self._mask = torch.ones_like(self._importance_scores, dtype=torch.bool)
             return
 
-        # Adaptive threshold: kthvalue is O(N) partial selection
-        k_from_top = mid_n - usable_budget
-        flat_mid = mid_scores.reshape(-1, mid_n)
-        threshold, _ = flat_mid.kthvalue(k=k_from_top, dim=-1)
-        self._threshold = threshold.view(self._scores.shape[0], self._scores.shape[1])
+        # For importance threshold: only consider non-outlier blocks
+        # (outliers are already kept, don't waste budget on them)
+        mid_importance_masked = torch.where(
+            mid_outlier, torch.full_like(mid_importance, float("inf")), mid_importance
+        )
 
-        # Build mask
-        self._mask = torch.ones_like(self._scores, dtype=torch.bool)
-        mid_mask = mid_scores >= self._threshold.unsqueeze(-1)
-        self._mask[:, :, mid_start:mid_end] = mid_mask
+        # kthvalue on importance scores (excluding outliers which are inf)
+        # We want to keep remaining_budget non-outlier blocks
+        n_non_outlier = mid_n - n_outliers_in_mid.long()
+        k_from_top = (n_non_outlier.float() - remaining_budget.float()).clamp(min=1).long()
+
+        # Per-head threshold via kthvalue
+        flat = mid_importance.reshape(-1, mid_n)
+        # Use max possible k across all heads for batched kthvalue
+        max_k = k_from_top.reshape(-1).max().item()
+        max_k = min(max(int(max_k), 1), mid_n)
+        threshold, _ = flat.kthvalue(k=max_k, dim=-1)
+        self._threshold = threshold.view(self._importance_scores.shape[0], self._importance_scores.shape[1])
+
+        # Build mask: importance OR outlier
+        self._mask = torch.ones_like(self._importance_scores, dtype=torch.bool)
+        importance_mask = mid_importance >= self._threshold.unsqueeze(-1)
+        self._mask[:, :, mid_start:mid_end] = importance_mask | mid_outlier
 
     def get_mask(self) -> torch.Tensor:
         """Get current importance mask. O(1).
@@ -207,10 +269,16 @@ class StreamingKImportance:
         return self._mask
 
     def get_scores(self) -> torch.Tensor:
-        """Get raw importance scores. [BSZ, HEAD, N_BLOCKS]."""
-        if self._scores is None:
+        """Get combined scores (importance + outlier bonus). [BSZ, HEAD, N_BLOCKS]."""
+        if self._importance_scores is None:
             raise RuntimeError("No tokens processed yet.")
-        return self._scores
+        return self._importance_scores
+
+    def get_outlier_scores(self) -> torch.Tensor:
+        """Get outlier deviation scores. [BSZ, HEAD, N_BLOCKS]."""
+        if self._outlier_scores is None:
+            raise RuntimeError("No tokens processed yet.")
+        return self._outlier_scores
 
     @property
     def n_blocks(self) -> int:
@@ -227,8 +295,10 @@ class StreamingKImportance:
         """Reset all state for new sequence."""
         self._initialized = False
         self._k_sum = None
+        self._k_sq_sum = None
         self._n_tokens = 0
-        self._scores = None
+        self._importance_scores = None
+        self._outlier_scores = None
         self._n_blocks = 0
         self._mask = None
         self._threshold = None

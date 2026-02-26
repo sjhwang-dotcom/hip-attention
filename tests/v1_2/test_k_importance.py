@@ -164,6 +164,70 @@ class TestStreamingKImportance:
         print(f"  Per-token streaming: {t_streaming/n_tokens*1e6:.1f} us")
 
 
+class TestOutlierDetection:
+    def test_outlier_block_always_kept(self):
+        """Blocks with keys far from mean must survive budget cuts."""
+        tracker = StreamingKImportance(
+            budget=4, block_size=4, dim=64, sink_blocks=0, window_blocks=0,
+            outlier_sigma=2.0,
+        )
+        # 10 blocks of normal keys
+        k = torch.randn(1, 1, 40, 64) * 0.1
+        # Block 5 (tokens 20-23) is a massive outlier
+        k[:, :, 20:24, :] = torch.randn(1, 1, 4, 64) * 50.0
+        tracker.update(k)
+
+        mask = tracker.get_mask()
+        # Block 5 must be kept despite budget=4
+        assert mask[0, 0, 5].item(), "Outlier block must survive budget cuts"
+
+    def test_outlier_scores_separate(self):
+        tracker = StreamingKImportance(
+            budget=8, block_size=4, dim=64, sink_blocks=0, window_blocks=0,
+        )
+        k = torch.randn(1, 1, 20, 64)
+        k[:, :, 8:12, :] *= 20.0  # Block 2 is outlier
+        tracker.update(k)
+
+        outlier = tracker.get_outlier_scores()
+        assert outlier[0, 0, 2] > outlier[0, 0, 0], \
+            "Outlier block should have higher deviation score"
+
+    def test_normal_blocks_not_flagged_as_outlier(self):
+        tracker = StreamingKImportance(
+            budget=8, block_size=4, dim=64, sink_blocks=0, window_blocks=0,
+            outlier_sigma=3.0,
+        )
+        # All uniform, no outliers
+        k = torch.randn(1, 1, 32, 64)
+        tracker.update(k)
+
+        outlier = tracker.get_outlier_scores()
+        # With sigma=3.0, normal blocks should mostly be below threshold
+        n_flagged = (outlier >= 3.0).sum().item()
+        assert n_flagged <= 2, f"Too many false outliers: {n_flagged}"
+
+    def test_delta_unrecoverable_outlier(self):
+        """Simulate delta correction failure: outlier in sparse region."""
+        tracker = StreamingKImportance(
+            budget=4, block_size=4, dim=64, sink_blocks=1, window_blocks=1,
+            outlier_sigma=2.0,
+        )
+        k = torch.randn(1, 1, 40, 64) * 0.1
+        # Outlier in the middle (not sink, not window)
+        k[:, :, 16:20, :] = torch.randn(1, 1, 4, 64) * 30.0
+        tracker.update(k)
+
+        mask = tracker.get_mask()
+        # Block 4 (mid-region outlier) must be kept
+        assert mask[0, 0, 4].item(), \
+            "Mid-region outlier must be kept (delta cannot recover)"
+        # Sink (block 0) must be kept
+        assert mask[0, 0, 0].item()
+        # Window (last block) must be kept
+        assert mask[0, 0, -1].item()
+
+
 class TestBatchCompute:
     def test_output_shape(self):
         pass  # compute_k_importance imported at module level
