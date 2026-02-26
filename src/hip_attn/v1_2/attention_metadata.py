@@ -317,7 +317,6 @@ class HiPAttentionArgs:
             self.logit_softcap = None
 
     def clone(self):
-        self.update_flags()
         return copy.copy(self)
 
     def json(self, convert_tensor_to_meta=True):

@@ -297,7 +297,6 @@ def dual_stage_quadratic_hip_attention(
         position_ids = (torch.arange(0, TDST, device=q.device) + (TSRC - TDST))[
             None, :
         ].expand(BSZ, TDST)
-        args = args.clone()
         args.position_ids = position_ids
     assert position_ids.shape == (BSZ, TDST), position_ids.shape
 
@@ -1285,7 +1284,6 @@ def dual_stage_quadratic_hip_attention(
                 cv2.imwrite("dummy_sampled_final.png", debug)
             # print('saved dummy_sampled_final.png')
 
-        args = args.clone()
         args.block_size_q = args.stages[-1].stage_block_size_q
         block_sparse_block_size_q = min(
             args.block_sparse_block_size_q, args.block_size_q
@@ -1456,7 +1454,6 @@ def dual_stage_quadratic_hip_attention(
         if args.mask_only:
             return None, None
     else:
-        args = args.clone()
         args.sliding_window_size += args.mask_k
         args.block_size_k = args.stages[-1].stage_chunk_size
         args.mask_k = args.second_stage_k
@@ -1498,7 +1495,6 @@ def dual_stage_quadratic_hip_attention(
     # block_sparse_attention_backend = tilelang_bsa
 
     if args.bsa_sliding_window_size > 0:
-        args = args.clone()
         args.sliding_window_size = args.bsa_sliding_window_size
 
     context = block_sparse_attention_backend(
