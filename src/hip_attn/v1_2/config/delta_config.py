@@ -26,7 +26,7 @@ class DeltaAttentionConfig:
     enabled: bool = False
     gamma: int = 16
     diff_mode: int = 1
-    smooth: bool = False
+    smooth: bool = True
     just_return: bool = False
     base_window_size: int = 0
     dense_decode: bool = False

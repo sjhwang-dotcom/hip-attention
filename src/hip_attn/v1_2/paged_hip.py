@@ -86,6 +86,20 @@ def get_local_rank() -> 0:
         return 0
 
 
+# --- Cached environment variables (parsed once, not per-forward) ---
+_HIP_DISABLE_COMPUTE_STATISTICS = os.getenv("HIP_DISABLE_COMPUTE_STATISTICS", "1") == "0"
+_HIP_DEBUG_USING_DENSE_PREFILL = os.getenv("HIP_DEBUG_USING_DENSE_PREFILL", "0") == "1"
+_HIP_DEBUG_FORCE_DENSE_DECODE = os.getenv("HIP_DEBUG_FORCE_DENSE_DECODE", "0") == "1"
+_HIP_DEBUG_LAST_DENSE = int(os.getenv("HIP_DEBUG_LAST_DENSE", "-1"))
+_HIP_DEBUG_SLLM_WINDOW = os.getenv("HIP_DEBUG_SLLM_WINDOW", None)
+_HIP_DEBUG_SLLM_SINK = os.getenv("HIP_DEBUG_SLLM_SINK", None)
+_HIP_DEBUG_SEQ_THRESH_FA3 = int(os.getenv("HIP_DEBUG_SEQ_THRESH_FA3", "0"))
+_HIP_DEBUG_FA3_MIXING_LEN = os.getenv("HIP_DEBUG_FA3_MIXING_LEN", None)
+_HIP_DEBUG_SEQ_THRESH_FA3_INF_DENSE = os.getenv("HIP_DEBUG_SEQ_THRESH_FA3_INF_DENSE", "0") == "1"
+_HIP_DEBUG_FORCE_CHUNKED_SW = os.getenv("HIP_DEBUG_FORCE_CHUNKED_SW", "0") == "1"
+_HIP_ENABLE_OFFLOAD_VALIDATION = os.getenv("HIP_ENABLE_OFFLOAD_VALIDATION", "0") == "1"
+
+
 def cuda_graph_capture_configs(hip_config: HiPAttentionConfig):
     num_stages = len(hip_config.layers[0].stages)
     cache_configs = [(None,)]  # (num_stage_cached,)
@@ -212,7 +226,7 @@ def forward_paged_hip(
                     new_states = []
                     for state in states:
                         for _ in range(n_repeat):
-                            new_states.append(copy.deepcopy(state))
+                            new_states.append(copy.copy(state))
                     states = new_states
                 else:
                     cached_metadata.state = None
@@ -452,7 +466,7 @@ def _forward_paged_hip_validate(
                 k = k_chunk_padded
                 v = v_chunk_padded
 
-    require_validation = offloading_metadata is not None
+    require_validation = offloading_metadata is not None and _HIP_ENABLE_OFFLOAD_VALIDATION
     if require_validation:
         if not is_decode:
             k_pages, v_pages = offloading_metadata
@@ -1181,7 +1195,7 @@ def _forward_paged_hip(
         require_cache_statistics = offload_cache is not None
     elif cached_metadata.indices is None:
         require_cache_statistics = offload_cache is not None
-    elif os.getenv("HIP_DISABLE_COMPUTE_STATISTICS", "1") == "0":
+    elif _HIP_DISABLE_COMPUTE_STATISTICS:
         require_cache_statistics = offload_cache is not None
 
     if torch.cuda.is_current_stream_capturing():
@@ -1242,14 +1256,14 @@ def _forward_paged_hip(
         self_extend_scale=self_extend_scale,
     )
 
-    using_dense_prefill = os.getenv("HIP_DEBUG_USING_DENSE_PREFILL", "0") == "1"
+    using_dense_prefill = _HIP_DEBUG_USING_DENSE_PREFILL
     if is_decode:
         using_dense_prefill = False
     else:
         using_dense_prefill = using_dense_prefill and is_dense
 
-    force_dense_decode = os.getenv("HIP_DEBUG_FORCE_DENSE_DECODE", "0") == "1"
-    last_dense = int(os.getenv("HIP_DEBUG_LAST_DENSE", "-1"))
+    force_dense_decode = _HIP_DEBUG_FORCE_DENSE_DECODE
+    last_dense = _HIP_DEBUG_LAST_DENSE
 
     if last_dense > 0:
         last_dense += dst_seq_len % args.block_sparse_block_size_q
@@ -1271,9 +1285,8 @@ def _forward_paged_hip(
         ]
         args.bsa_sliding_window_size = larger_sw_size
 
-    sliding_window_size = os.getenv("HIP_DEBUG_SLLM_WINDOW", sliding_window_size)
-    if isinstance(sliding_window_size, str):
-        sliding_window_size = int(sliding_window_size)
+    if _HIP_DEBUG_SLLM_WINDOW is not None:
+        sliding_window_size = int(_HIP_DEBUG_SLLM_WINDOW)
     if isinstance(sliding_window_sink, torch.Tensor):
         softmax_sink = sliding_window_sink
         sliding_window_sink = 0
@@ -1281,7 +1294,8 @@ def _forward_paged_hip(
     elif sliding_window_sink is None:
         sliding_window_sink = 0
     sliding_window_sink = int(
-        os.getenv("HIP_DEBUG_SLLM_SINK", max(0, sliding_window_sink))
+        _HIP_DEBUG_SLLM_SINK if _HIP_DEBUG_SLLM_SINK is not None
+        else max(0, sliding_window_sink)
     )
     if args.second_stage_k == 0:
         if sliding_window_size is not None and sliding_window_size > 0:
@@ -1291,7 +1305,7 @@ def _forward_paged_hip(
             sliding_window_size = args.sliding_window_size
             sliding_window_sink = args.sink_token_size
 
-    seq_thresh_fa3 = int(os.getenv("HIP_DEBUG_SEQ_THRESH_FA3", "0"))
+    seq_thresh_fa3 = _HIP_DEBUG_SEQ_THRESH_FA3
     if seq_thresh_fa3 > args.model_context_length:
         warnings.warn(
             f"Requested FA3 replacement ({seq_thresh_fa3}) is larger than model context length ({args.model_context_length}). "
@@ -1300,8 +1314,9 @@ def _forward_paged_hip(
         )
         seq_thresh_fa3 = args.model_context_length
 
-    mixing_len = os.getenv(
-        "HIP_DEBUG_FA3_MIXING_LEN", "0" if seq_thresh_fa3 > 0 else "0"
+    mixing_len = (
+        _HIP_DEBUG_FA3_MIXING_LEN if _HIP_DEBUG_FA3_MIXING_LEN is not None
+        else ("0" if seq_thresh_fa3 > 0 else "0")
     )
     if mixing_len.lower() == "sw":
         mixing_len = int(
@@ -1315,12 +1330,11 @@ def _forward_paged_hip(
     if seq_thresh_fa3 == 0:
         mixing_len = 0
 
-    if os.getenv("HIP_DEBUG_SEQ_THRESH_FA3_INF_DENSE", "0") == "1":
+    if _HIP_DEBUG_SEQ_THRESH_FA3_INF_DENSE:
         if layer_id in hip_config.dense_layers:
             seq_thresh_fa3 = query.shape[1]
 
-    from hip_attn.v1_2.config.delta_config import DeltaAttentionConfig
-    delta_config = DeltaAttentionConfig.from_env(using_extend=args.using_extend)
+    delta_config = hip_config.delta_config
     using_delta_attention = delta_config.enabled
     delta_attention_args_dense_decode = delta_config.dense_decode
 
@@ -1341,7 +1355,7 @@ def _forward_paged_hip(
 
     if isinstance(sliding_window_size, int) and (sliding_window_size > 0):
 
-        if os.getenv("HIP_DEBUG_FORCE_CHUNKED_SW", "0") == "1":
+        if _HIP_DEBUG_FORCE_CHUNKED_SW:
             args.using_chunked_sliding_window = True
 
         def __forward_sliding_window_wrapper(

@@ -84,24 +84,22 @@ def num_streaming_multiprocessor():
     return _NUM_STREAMING_MULTIPROCESSOR
 
 
+_HIP_FLASHDECODE_THRESH = int(os.getenv("HIP_FLASHDECODE_THRESH", "32"))
+_HIP_DISABLE_FLASHDECODE = os.environ.get("HIP_DISABLE_FLASHDECODE", "0") == "1"
+
+
 def get_block_sparse_backend(
     q: torch.Tensor,
     disable_flashdecode: HiPAttentionArgs,
 ) -> type(block_sparse_attention):
-    # return block_sparse_attention_tilelang
-
-    block_sparse_attention_backend = block_sparse_attention
-
-    # Use flashdecode
-    # print(q.shape, int(os.getenv("HIP_FLASHDECODE_THRESH", "32")), (not os.environ.get("HIP_DISABLE_FLASHDECODE", "0") == "1"), (not args.disable_flashdecode))
     if (
-        (q.shape[1] < int(os.getenv("HIP_FLASHDECODE_THRESH", "32")))
-        and (not os.environ.get("HIP_DISABLE_FLASHDECODE", "0") == "1")
+        (q.shape[1] < _HIP_FLASHDECODE_THRESH)
+        and (not _HIP_DISABLE_FLASHDECODE)
         and (not disable_flashdecode)
     ):
-        block_sparse_attention_backend = decode_block_sparse_attention
+        return decode_block_sparse_attention
 
-    return block_sparse_attention_backend
+    return block_sparse_attention
 
 
 @numba.njit(parallel=True)
