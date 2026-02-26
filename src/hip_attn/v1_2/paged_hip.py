@@ -1,16 +1,13 @@
 import copy
-import math
 import os
 import warnings
 from typing import Any, List, Optional
 
 import torch
 import triton
-from flash_attn import flash_attn_func
 from sgl_kernel.flash_attn import flash_attn_varlen_func as __flash_attn_varlen_func
 from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
-from hip_attn.v1_2.hip_config import HiPAttentionConfig
 from hip_attn.v1_2.utils import capture
 
 
@@ -70,20 +67,12 @@ from hip_attn.v1_2.attention_extend import (
 from hip_attn.v1_2.attention_metadata import (
     HiPAttentionArgs,
     HiPAttentionOutputMetadata,
-    HiPAttentionState,
 )
 from hip_attn.v1_2.hip_config import HiPAttentionConfig
-from hip_attn.v1_2.query_sparse_attention import query_sparse_attention
 from hip_attn.v1_2.uvm_gpu_cache import HiPOffloadCache
 
 try:
-    import torch.distributed as dist
-    from sglang.srt.distributed import (
-        get_tensor_model_parallel_rank,
-        split_tensor_along_last_dim,
-        tensor_model_parallel_all_gather,
-        tensor_model_parallel_all_reduce,
-    )
+    from sglang.srt.distributed import get_tensor_model_parallel_rank
 
     SGLANG_DIST_ACTIVATED = True
 except ImportError as ex:
@@ -95,16 +84,6 @@ def get_local_rank() -> 0:
         return get_tensor_model_parallel_rank()
     else:
         return 0
-
-
-_CHECKOUT_COUNTER = 0
-
-
-def rotate_half(x: torch.Tensor):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
 
 
 def cuda_graph_capture_configs(hip_config: HiPAttentionConfig):
@@ -167,10 +146,6 @@ def forward_paged_hip(
         is_decode = not is_prefill
 
     if v is None:
-        # warnings.warn(
-        #     "Deprecated behavior: `k` and `v` should be provided in order to precisely know the output size."
-        # )
-
         if v_cache is not None:
             v_hidden_dim = v_cache.shape[-1]
         else:
@@ -210,11 +185,6 @@ def forward_paged_hip(
                 if len(extend_seq_lens_cpu) != query.shape[0]:
                     assert (len(extend_seq_lens_cpu) % query.shape[0]) == 0
                     n_repeat = len(extend_seq_lens_cpu) // query.shape[0]
-                    # query = query.repeat_interleave(n_repeat, 0)
-                    # if k is not None:
-                    #     k = k.repeat_interleave(n_repeat, 0)
-                    # if v is not None:
-                    #     v = v.repeat_interleave(n_repeat, 0)
                     extend_seq_lens_cpu = extend_seq_lens_cpu[::n_repeat]
                     extend_prefix_lens_cpu = extend_prefix_lens_cpu[::n_repeat]
             BSZ_TDST = query.shape[0] * query.shape[1]
@@ -850,17 +820,6 @@ def _forward_fa3_decode(
 ):
     assert q.ndim == 4
 
-    # _cache_seqlens = (position_ids[:, -1] + 1).to(torch.int32)
-    # _cu_seqlens_q = torch.arange(
-    #     0, q.shape[0] + 1, q.shape[1], device=q.device, dtype=torch.int32
-    # )
-    # _cu_seqlens_k = _cu_seqlens_q.clone()
-    # _cu_seqlens_k[1:] = cache_seqlens.cumsum(-1)
-
-    # assert torch.all(_cache_seqlens == cache_seqlens)
-    # assert torch.all(_cu_seqlens_q == cu_seqlens_q)
-    # assert torch.all(_cu_seqlens_k == cu_seqlens_k)
-
     max_seqlen_q = q.shape[1]
     q_reshaped = q.view(-1, q.shape[-2], q.shape[-1])
 
@@ -956,18 +915,6 @@ def _forward_fa3(
 
             q[..., -rope_dim:] = query_rot
             k[..., -rope_dim:] = key_rot
-
-            # qqq = query_fa3[0, -4096:, 0]
-            # kkk = k_fa3[0, :, 0]
-            # scores = qqq @ kkk.T
-            # scores = torch.nn.functional.max_pool2d(scores[None, None, ...], kernel_size=31, stride=15, padding=15)[0,0]
-
-            # plt.clf()
-            # plt.title(f'{scores.shape=}')
-            # plt.imshow(scores.float().cpu().numpy())
-            # plt.savefig('./dummy_scores.png')
-
-            # print(rope_dim, args.rope_cos.shape, args.rope_sin.shape, args.rope_is_neox_style)
         else:
             q = q.clone()
             k = k.clone()
@@ -1038,21 +985,11 @@ def _forward_fa3(
     tp_k_head, tp_k_dim = k.shape[2:]
     tp_v_head, tp_v_dim = v.shape[2:]
 
-    # cu_seqlens_q = torch.tensor([0, q_len], dtype=torch.int32, device=q.device)
-    # max_seqlen_q = q_len
-
-    # # Construct metadata for the Key/Value
-    # # For a single sequence of length kv_len, cu_seqlens is just [0, kv_len]
-    # cu_seqlens_k = torch.tensor([0, kv_len], dtype=torch.int32, device=k.device)
-    # max_seqlen_k = kv_len
-
     cu_seqlens_q = torch.tensor([0, q.shape[1]], dtype=torch.int32, device=q.device)
     max_seqlen_q = q.shape[1]
     cu_seqlens_k = torch.zeros((2,), dtype=torch.int32, device=k.device)
     cu_seqlens_k[1] = position_ids[0, len_query_for_fa3 - 1] + 1
     max_seqlen_k = k.shape[1]
-
-    # print(query_fa3.shape, k_fa3.shape, v_fa3.shape, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, sm_scale)
 
     context_fa3 = flash_attn_varlen_func(
         q=q.view(-1, tp_q_head, tp_q_dim).contiguous(),
@@ -1074,377 +1011,8 @@ def _forward_fa3(
     return context_fa3
 
 
-@capture
-def _forward_partial_fa3(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    sm_scale: float,
-    rope_is_neox_style: bool,
-    cached_metadata: HiPAttentionOutputMetadata,
-    is_decode: bool,
-    seq_thresh_fa3: int,
-    mixing_len: int,
-    args: HiPAttentionArgs,
-    max_context_len: int,
-    k_descale: torch.Tensor,
-    v_descale: torch.Tensor,
-    inner_function_do_scale: bool,
-    inner_function,
-):
-    query = q
-
-    context_fa3 = None
-    metadata = None
-
-    if (not is_decode) and (seq_thresh_fa3 > 0):
-        if args.using_paged_cache:
-            pass
-        else:
-            assert k is not None
-            max_context_len = min(max_context_len, k.shape[1])
-        min_context_len = max(0, max_context_len - query.shape[1])
-
-        len_query_for_fa3 = max(
-            0, min(seq_thresh_fa3, max_context_len) - min_context_len
-        )
-        len_query_for_hip = max(
-            0, max_context_len - max(min_context_len, seq_thresh_fa3 - mixing_len)
-        )
-
-        # print(max_context_len, min_context_len, seq_thresh_fa3, len_query_for_fa3, len_query_for_hip)
-
-        if len_query_for_fa3 > 0:
-            assert not is_decode
-            # assert not args.using_extend, "todo"
-
-            if args.using_paged_cache:
-                k = args.gather_k_from_paged_cache(
-                    seq_len=min(max_context_len, args.model_context_length)
-                )
-                v = args.gather_v_from_paged_cache(
-                    seq_len=min(max_context_len, args.model_context_length)
-                )
-
-            query_fa3 = query[:, :len_query_for_fa3].contiguous()
-            len_kv = k.shape[1] - (
-                len_query_for_hip - (query.shape[1] - len_query_for_fa3)
-            )  # BUG: this should be bug, because this will lose keys for len_for_mix
-            k_fa3 = k[:, :len_kv].contiguous()
-            v_fa3 = v[:, :len_kv].contiguous()
-
-            is_fp8 = k.dtype in (torch.float8_e5m2,)
-            if is_fp8:
-                query_fa3 = query_fa3.to(torch.float16)
-                k_fa3 = k_fa3.to(torch.float16)
-                v_fa3 = v_fa3.to(torch.float16)
-
-            if k.dtype == torch.float8_e4m3fn:
-                query_fa3 = query_fa3.to(k.dtype)
-
-            context_fa3 = _forward_fa3(
-                q=query_fa3,
-                k=k_fa3,
-                v=v_fa3,
-                sm_scale=sm_scale,
-                position_ids=args.position_ids[:, :len_query_for_fa3],
-                using_extend=args.using_extend,
-                need_apply_rope=args.need_apply_rope,
-                rope_cos=args.rope_cos,
-                rope_sin=args.rope_sin,
-                rope_is_neox_style=rope_is_neox_style,
-                k_descale=k_descale,
-                v_descale=v_descale,
-            )
-
-    if args.using_paged_cache:
-        k = v = None
-
-    if context_fa3 is not None:
-        if len_query_for_hip > 0:
-            args_sparse = args.clone()
-            args_sparse.position_ids = args_sparse.position_ids[:, -len_query_for_hip:]
-            if args_sparse.q_mask is not None:
-                args_sparse.q_mask = args_sparse.q_mask[:, -len_query_for_hip:]
-            if args_sparse.query_for_landmark is not None:
-                args_sparse.query_for_landmark = args_sparse.query_for_landmark[
-                    :, -len_query_for_hip:
-                ]
-
-            yarn_scale = float(os.getenv("HIP_DEBUG_YARN_SCALE_HINT", "1"))
-            if yarn_scale > 1:
-                assert int(yarn_scale) == yarn_scale
-                yarn_scale = int(yarn_scale)
-                args_sparse.rope_cos = args_sparse.rope_cos[::yarn_scale]
-                args_sparse.rope_sin = args_sparse.rope_sin[::yarn_scale]
-
-            context_sparse, metadata = inner_function(
-                q=(
-                    query[:, -len_query_for_hip:]
-                    * (sm_scale if inner_function_do_scale else 1)
-                ).to(query.dtype),
-                k=k,
-                v=v,
-                args=args_sparse,
-                cached_metadata=cached_metadata,
-            )
-            if context_sparse.ndim == 3:
-                context_sparse = context_sparse.unsqueeze(0)
-                assert context_fa3.shape[0] == 1
-
-            # w = 512
-            # wt = 16
-            # t = context_sparse.shape[1]
-            # if t > w:
-            #     t_context = context_sparse[:, t % w:]
-            #     t_context_mean = t_context.view(-1, t // w, w, t_context.shape[-2], t_context.shape[-1]).mean(2, keepdim=True)
-            #     delta = (torch.repeat_interleave(t_context_mean, w//wt, 1) - t_context.view(-1, t // wt, wt, t_context.shape[-2], t_context.shape[-1])).mean(2)
-            #     delta = torch.repeat_interleave(delta, wt, 1)
-            #     t_context.add_(delta)
-
-            len_for_mix = (len_query_for_hip + len_query_for_fa3) - query.shape[1]
-
-            if len_for_mix > 0:
-                context_fa3_mix = context_fa3[:, -len_for_mix:]
-                context_sparse_mix = context_sparse[:, :len_for_mix]
-
-                chunk_len = min(context_sparse_mix.shape[1], len_for_mix)
-                offset = min_context_len - (seq_thresh_fa3 - mixing_len)
-                scale_global = (
-                    torch.arange(
-                        offset,
-                        offset + chunk_len,
-                        device=query.device,
-                        dtype=torch.float32,
-                    )
-                    / mixing_len
-                )
-
-                len_for_spike = min(chunk_len, 32)
-                scale = torch.clamp_min(
-                    (
-                        torch.arange(
-                            0, chunk_len, device=query.device, dtype=torch.float32
-                        )
-                        - (chunk_len - len_for_spike)
-                    )
-                    / len_for_spike,
-                    0,
-                )  # * (1 - (offset / mixing_len)) + (offset / mixing_len)
-
-                # scale_spike = (
-                #     (torch.arange(
-                #         offset, offset + chunk_len, device=query.device, dtype=torch.float32
-                #     ) % len_for_spike)
-                #     / len_for_spike
-                # )
-                # scale = torch.maximum(scale, scale_spike)
-
-                scale = torch.maximum(scale, scale_global)
-
-                scale = scale[None, :, None, None]
-                context_mix = (
-                    context_sparse_mix * scale + context_fa3_mix * (1.0 - scale)
-                ).to(context_fa3_mix.dtype)
-
-                context = torch.cat(
-                    [
-                        context_fa3[:, :-len_for_mix],
-                        context_mix,
-                        context_sparse[:, len_for_mix:],
-                    ],
-                    dim=1,
-                )
-            else:
-                context = torch.cat([context_fa3, context_sparse], dim=1)
-        else:
-            context = context_fa3
-    else:
-        # no fa3
-        context, metadata = inner_function(
-            q=(query * (sm_scale if inner_function_do_scale else 1)).to(query.dtype),
-            k=k,
-            v=v,
-            args=args,
-            cached_metadata=cached_metadata,
-        )
-
-    context = context.to(query.dtype)
-
-    return context, metadata
-
-
-@capture
-def _forward_bsa_meanpool(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    args: HiPAttentionArgs,
-    sliding_window_size: int,
-    sliding_window_sink: int,
-    k_descale: torch.Tensor,
-    v_descale: torch.Tensor,
-):
-    query = q
-    key = args.gather_k_from_paged_cache()
-    value = args.gather_v_from_paged_cache()
-    bsa_fn = get_block_sparse_backend(query, args.disable_flashdecode)
-
-    # dist.barrier()
-    # if get_tensor_model_parallel_rank() == 0:
-    #     print(bsa_fn, args.using_extend, sliding_window_size, args.using_chunked_sliding_window)
-
-    # if (get_local_rank() == 0):
-    #     info_msg = f"{query.size()=} {key.size()=} {value.size()} "
-    #     warnings.warn(info_msg)
-
-    # trim excess off of q,k,v =====================================================
-    BSZ, TDST, HEAD, HID = query.shape
-    _, TSRC, HEAD_KV, _ = key.shape
-    assert TDST > 1, f"this should not be used in decode: {TDST=}"
-
-    args.block_size_q = 128
-    args.block_size_k = 64
-
-    if TSRC != TDST:
-        TSRC = TDST
-        key = key[:, :TSRC]
-        value = value[:, :TSRC]
-
-    # new version, passkey is wrong for some reason
-    to_trim, to_pad = TDST % args.block_size_q, 0
-    q_trimmed, k_trimmed = query, key
-    if to_trim > 0:
-        to_pad = args.block_size_q - to_trim
-        q_trimmed = torch.cat((query, query[:, -to_pad:]), dim=1)
-    to_trim = TSRC % args.block_size_k
-    if to_trim > 0:
-        to_pad = args.block_size_k - to_trim
-        k_trimmed = torch.cat((key, key[:, -to_pad:]), dim=1)
-
-    # old version
-    # to_trim = TDST % args.block_size_q
-    # q_trimmed, k_trimmed = query, key
-    # if to_trim > 0:
-    #     q_trimmed = query[:, :-to_trim]
-    #     k_trimmed = key[:, :-to_trim]
-
-    # repeat GQA, meanpool, attn =====================================================
-    q_trimmed = q_trimmed.reshape(
-        BSZ, triton.cdiv(TDST, args.block_size_q), args.block_size_q, HEAD, HID
-    ).mean(dim=2)
-    k_trimmed = k_trimmed.reshape(
-        BSZ, triton.cdiv(TSRC, args.block_size_k), args.block_size_k, HEAD_KV, HID
-    ).mean(dim=2, keepdim=True)
-    k_trimmed = k_trimmed.repeat(1, 1, HEAD // HEAD_KV, 1, 1).reshape(
-        BSZ, triton.cdiv(TSRC, args.block_size_k), HEAD, HID
-    )
-
-    qk = torch.einsum("bqhd,bkhd->bhqk", q_trimmed, k_trimmed)
-
-    if get_local_rank() == 0:
-        info_msg = f"{qk.size()=} "
-        warnings.warn(info_msg)
-
-    ratio = int(args.block_size_q / args.block_size_k)
-    # mask_n = (torch.arange(qk.size(2)).to(qk.device) + 1) * ratio
-
-    mask = (
-        torch.arange(0, qk.shape[3], device=qk.device)[None, None, None, :]
-        * args.block_size_k
-        >= (
-            torch.arange(0, qk.shape[2], device=qk.device)[None, None, :, None]
-            * args.block_size_q
-            - args.sliding_window_size
-        )
-    ).expand(*qk.shape)
-
-    qk += mask * torch.finfo(qk.dtype).min
-    qk = qk.softmax(dim=-1)
-    # K = int(os.environ.get("BSA_K", "0"))
-    K = 4096 // args.block_size_k
-    assert K != 0, "you should set BSA_K"
-
-    # do topk =====================================================
-    topk = qk.topk(K, dim=-1).indices * args.block_size_k
-    topk = topk.sort(dim=-1).values
-
-    args = args.clone()
-    if args.rope_range is None:
-        args.rope_range = (0, HID)
-
-    # args.block_size_q = args.block_sparse_block_size_q
-    # args.block_size_k = args.stages[-1].stage_chunk_size
-    # args.second_stage_k = 0
-    args.sink_token_size = sliding_window_sink
-    args.sliding_window_size = (
-        sliding_window_size if sliding_window_size is not None else 1024
-    )
-    args.sliding_window_indices = None
-
-    BDST = triton.cdiv(TDST, args.block_size_q)
-    BH = BSZ * HEAD
-
-    # indices = torch.zeros((BH, BDST, 0), dtype=torch.int64, device=query.device)
-    # ks_count = ks.unsqueeze(-1)
-    # ks_start_end = torch.zeros((BH, BDST, 2), dtype=torch.int64, device=query.device)
-    # ks = torch.zeros((BH, BDST), dtype=torch.int64, device=query.device)
-
-    args_sparse = args.clone()
-    args_sparse.rope_range = (0, query.shape[-1])
-    args_sparse.position_ids = args_sparse.position_ids[:, :]
-    args_sparse.block_size_q = args.block_size_q
-    args_sparse.block_sparse_block_size_q = args.block_size_q
-    args_sparse.block_size_k = args.block_size_k
-    args_sparse.sliding_window_size = args.sliding_window_size
-
-    indices = topk.flatten(0, 1)
-    if (
-        math.ceil(args_sparse.position_ids.shape[-1] / args_sparse.block_size_q)
-        > indices.shape[1]
-    ):
-        n_repeat = (
-            math.ceil(args_sparse.position_ids.shape[-1] / args_sparse.block_size_q)
-            - indices.shape[1]
-        )
-        indices = torch.cat(
-            [indices, torch.repeat_interleave(indices[:, -1:, :], n_repeat, 1)], dim=1
-        )
-    active_mask = indices < (
-        args_sparse.position_ids[
-            :, :: args_sparse.block_size_q, None
-        ].repeat_interleave(query.shape[2], 0)
-    )
-    ks = active_mask.int().sum(-1)
-    ks_count = ks.unsqueeze(-1)
-    ks_start_end = torch.zeros(
-        (ks.shape[0], ks.shape[1], 2),
-        dtype=torch.int32,
-        device=query.device,
-    )
-    ks_start_end[:, :, -1] = ks
-
-    context = bsa_fn(
-        q=query,
-        k=key,
-        v=value,
-        seq_lens=args.position_ids + 1,
-        indices=indices,
-        ks=ks,
-        ks_count=ks_count,
-        ks_start_end=ks_start_end,
-        access_counter=None,
-        cache_miss_counter=None,
-        EXTEND_BACKEND=args.sa_extend_backend,
-        model_context_length=args.model_context_length,
-        extend_context_length=args.extend_context_length,
-        offload_update_cache=False,
-        args=args_sparse,
-        k_descale=k_descale,
-        v_descale=v_descale,
-    )
-    context = context.to(query.dtype)
-    return context, None
+# Extracted to pipeline/partial_fa3.py -- re-exported for backward compatibility
+from hip_attn.v1_2.pipeline.partial_fa3 import _forward_partial_fa3  # noqa: F401
 
 
 @capture
@@ -1460,10 +1028,6 @@ def _forward_sliding_window(
 ):
     query = q
     bsa_fn = get_block_sparse_backend(query, args.disable_flashdecode)
-
-    # dist.barrier()
-    # if get_tensor_model_parallel_rank() == 0:
-    #     print(bsa_fn, args.using_extend, sliding_window_size, args.using_chunked_sliding_window)
 
     BSZ, TDST, HEAD, HID = query.shape
 
@@ -1551,8 +1115,6 @@ def _forward_paged_hip(
     cu_seqlens_k: Optional[torch.Tensor] = None,
     self_extend_scale: int = 12,
 ) -> tuple[torch.Tensor, HiPAttentionOutputMetadata]:
-    global _CHECKOUT_COUNTER
-
     if query.ndim == 3:
         N, num_heads, hidden_dims = query.shape
         dst_seq_len = N // batch_size
@@ -1626,17 +1188,7 @@ def _forward_paged_hip(
         assert is_decode
 
     args = HiPAttentionArgs(
-        # k_cache=(
-        #     k_cache.view(torch.uint8)
-        #     if isinstance(k_cache, torch.Tensor) and k_cache.dtype == torch.float8_e5m2
-        #     else k_cache
-        # ),
         k_cache=k_cache,
-        # v_cache=(
-        #     v_cache.view(torch.uint8)
-        #     if isinstance(k_cache, torch.Tensor) and v_cache.dtype == torch.float8_e5m2
-        #     else v_cache
-        # ),
         v_cache=v_cache,
         offload_cache=offload_cache,
         block_table=block_table,
@@ -1695,7 +1247,6 @@ def _forward_paged_hip(
         using_dense_prefill = False
     else:
         using_dense_prefill = using_dense_prefill and is_dense
-        # using_dense_prefill = True
 
     force_dense_decode = os.getenv("HIP_DEBUG_FORCE_DENSE_DECODE", "0") == "1"
     last_dense = int(os.getenv("HIP_DEBUG_LAST_DENSE", "-1"))
@@ -1740,18 +1291,6 @@ def _forward_paged_hip(
             sliding_window_size = args.sliding_window_size
             sliding_window_sink = args.sink_token_size
 
-    # if True:
-    #     if (not is_decode) and (dst_seq_len == 1) and (args.using_extend and args.sa_extend_backend == "self_extend"):
-    #         print('asduogsh')
-    #         sliding_window_size = args.model_context_length
-
-    # Plan 1
-    # TODO use flash attention under 100K
-
-    # Plan 2
-    # TODO use flash attention under 64K
-    # TODO use sparse setting under 128K
-
     seq_thresh_fa3 = int(os.getenv("HIP_DEBUG_SEQ_THRESH_FA3", "0"))
     if seq_thresh_fa3 > args.model_context_length:
         warnings.warn(
@@ -1780,14 +1319,9 @@ def _forward_paged_hip(
         if layer_id in hip_config.dense_layers:
             seq_thresh_fa3 = query.shape[1]
 
-    # TODO: if delta norm is too high, then just recompute that whole block.
-    # TODO: use partial densely decode. delta attention for decode
-    # postfix_recompute_dense-window_[size:int]-diff_[1/0]-w_[size:int]
-    # example: HIP_DELTA_ATTENTION_ARGS=window_0-diff_1-w_32-dense_decode-smooth
     from hip_attn.v1_2.config.delta_config import DeltaAttentionConfig
     delta_config = DeltaAttentionConfig.from_env(using_extend=args.using_extend)
     using_delta_attention = delta_config.enabled
-    bsa_meanpool = delta_config.bsa_meanpool
     delta_attention_args_dense_decode = delta_config.dense_decode
 
     if using_delta_attention and (get_local_rank() == 0) and (not is_decode):
@@ -1802,7 +1336,6 @@ def _forward_paged_hip(
             f"exp_enabled={delta_config.exp_enabled} "
             f"exp_w={delta_config.exp_w} "
             f"extend_mode={delta_config.extend_mode} "
-            f"{bsa_meanpool=} "
         )
         warnings.warn(info_msg)
 
@@ -1845,43 +1378,6 @@ def _forward_paged_hip(
             v_descale=v_descale,
             inner_function_do_scale=True,
             inner_function=__forward_sliding_window_wrapper,
-        )
-    elif bsa_meanpool and ((not is_decode)):
-
-        def __forward_bsa_meanpool_attn_wrapper(
-            q: torch.Tensor,
-            k: torch.Tensor,
-            v: torch.Tensor,
-            args: HiPAttentionArgs,
-            cached_metadata: HiPAttentionOutputMetadata,
-        ):
-            return _forward_bsa_meanpool(
-                q,
-                k,
-                v,
-                args=args,
-                sliding_window_size=max(args.sliding_window_size, sliding_window_size),
-                sliding_window_sink=max(args.sink_token_size, sliding_window_sink),
-                k_descale=k_descale,
-                v_descale=v_descale,
-            )
-
-        context, metadata = _forward_partial_fa3(
-            q=query,
-            k=k,
-            v=v,
-            sm_scale=sm_scale,
-            rope_is_neox_style=rope_is_neox_style,
-            cached_metadata=cached_metadata,
-            is_decode=is_decode,
-            seq_thresh_fa3=seq_thresh_fa3,
-            mixing_len=mixing_len,
-            args=args,
-            max_context_len=max_batch_context_len,
-            k_descale=k_descale,
-            v_descale=v_descale,
-            inner_function_do_scale=True,
-            inner_function=__forward_bsa_meanpool_attn_wrapper,
         )
     elif using_delta_attention and (
         (not is_decode)  # or (is_decode and delta_attention_args_dense_decode)
@@ -2005,7 +1501,6 @@ def _forward_paged_hip(
             inner_function_do_scale=True,
             inner_function=dual_stage_quadratic_hip_attention,
         )
-        # context = context[:, -query.shape[1] :, :, :].contiguous()
     else:
         assert not is_decode
         assert last_dense > 0
@@ -2030,14 +1525,6 @@ def _forward_paged_hip(
         args_dense.sink_token_size *= 2
         if args_dense.q_mask is not None:
             args_dense.q_mask = args_dense.q_mask[:, -last_dense:, :, :]
-        # print(
-        #     query.shape,
-        #     k.shape if k is not None else None,
-        #     v.shape if v is not None else None,
-        #     args_dense.sliding_window_size,
-        #     args_dense.sink_token_size,
-        #     args_dense.second_stage_k
-        # )
         last_block = triton.cdiv(last_dense, args_dense.block_sparse_block_size_q)
         metadata.indices = metadata.indices[:, -last_block:]
         metadata.ks = metadata.ks[:, -last_block:]
@@ -2054,55 +1541,6 @@ def _forward_paged_hip(
 
         context = torch.cat([context_sparse[:, :-last_dense], context_dense], dim=1)
         context = context[:, -query.shape[1] :, :, :].contiguous()
-
-    # layers_to_capture = [0, 1, 2, 3, 4, 8, 12, 16, 24, 31]
-    layers_to_capture = [i for i in range(32)]
-    NEED_CHECKOUT = os.getenv("HIP_DEBUG_NEED_CHECKOUT", "0") == "1"
-    if (
-        NEED_CHECKOUT
-        and (get_tensor_model_parallel_rank() == 0)
-        and (layer_id in layers_to_capture)
-    ):
-        # root = "./saves/sglang_decode"
-        root = os.environ.get("HIP_DEBUG_NEED_CHECKOUT_ROOT", "./saves")
-        os.makedirs(root, exist_ok=True)
-        if not os.path.exists(root):
-            _CHECKOUT_COUNTER = 0
-        filename = f"{root}/checkout_sample_{_CHECKOUT_COUNTER}_layer_{layer_id}_is_decode_{1 if is_decode else 0}-0.pth"
-        os.makedirs(root, exist_ok=True)
-
-        if (not is_decode) and (
-            dst_seq_len not in [256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
-        ):
-            while os.path.exists(filename):
-                pre, post = filename.split(".")
-                filename = pre[:-1] + f"{int(pre[-1]) + 1}." + post
-
-            torch.save(
-                {
-                    "q": query,
-                    "sm_scale": sm_scale,
-                    "k": (
-                        k
-                        if k is not None
-                        else args.gather_k_from_paged_cache(chunk_size=1)
-                    ),
-                    "v": (
-                        v
-                        if k is not None
-                        else args.gather_v_from_paged_cache(chunk_size=1)
-                    ),
-                    "block_table": block_table,
-                    "cos": rope_cos,
-                    "sin": rope_sin,
-                    "out": context,
-                    "metadata": metadata,
-                },
-                filename,
-            )
-            if is_decode and (layer_id == max(layers_to_capture)):
-                _CHECKOUT_COUNTER += 1
-            print(f"saved {filename}")
 
     context = context.to(query.dtype)
     assert context.dtype == query.dtype, f"{context.dtype} == {query.dtype}"
@@ -2215,9 +1653,6 @@ class PagedHiPStateful:
                 and (metadata.indices is not None)
             )
             if require_update:
-                # k = kwargs.get('k', None)
-                # v = kwargs.get('v', None)
-
                 query = query.view(batch_size, 1, self.num_heads, self.head_dim)
                 args = hip_args.clone()
                 if args.rope_range is None:
@@ -2228,18 +1663,6 @@ class PagedHiPStateful:
                     args.block_sparse_block_size_q,
                     layer_config.stages[-1].stage_block_size_q,
                 )
-
-                # print(
-                #     'hi',
-                #     args.sliding_window_size,
-                #     args.sink_token_size,
-                #     layer_config.sliding_window_size_for_masking_step,
-                #     args.block_size_q,
-                #     args.block_size_k,
-                #     metadata.indices.shape,
-                #     args.position_ids.shape,
-                #     query.shape,
-                # )
 
                 assert query.ndim == 4
                 o_sparse = bsa_fn(
